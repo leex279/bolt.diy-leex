@@ -66,6 +66,9 @@ export class BoltShell {
   >();
   #outputStream: ReadableStreamDefaultReader<string> | undefined;
   #shellInputStream: WritableStreamDefaultWriter<string> | undefined;
+  #expoUrlReader: ReadableStreamDefaultReader<string> | undefined;
+  #disposed = false;
+  #expoWatcherAbortController?: AbortController;
 
   constructor() {
     this.#readyPromise = new Promise((resolve) => {
@@ -78,6 +81,10 @@ export class BoltShell {
   }
 
   async init(webcontainer: WebContainer, terminal: ITerminal) {
+    if (this.#disposed) {
+      throw new Error('Cannot initialize disposed BoltShell');
+    }
+
     this.#webcontainer = webcontainer;
     this.#terminal = terminal;
 
@@ -85,9 +92,11 @@ export class BoltShell {
     const { process, commandStream, expoUrlStream } = await this.newBoltShellProcess(webcontainer, terminal);
     this.#process = process;
     this.#outputStream = commandStream.getReader();
+    this.#expoUrlReader = expoUrlStream.getReader();
 
-    // Start background Expo URL watcher immediately
-    this._watchExpoUrlInBackground(expoUrlStream);
+    // Start background Expo URL watcher immediately with AbortController
+    this.#expoWatcherAbortController = new AbortController();
+    this._watchExpoUrlInBackground();
 
     await this.waitTillOscCode('interactive');
     this.#initialized?.();
@@ -140,33 +149,51 @@ export class BoltShell {
     return { process, terminalStream: streamA, commandStream: streamC, expoUrlStream: streamD };
   }
 
-  // Dedicated background watcher for Expo URL
-  private async _watchExpoUrlInBackground(stream: ReadableStream<string>) {
-    const reader = stream.getReader();
+  // Dedicated background watcher for Expo URL with proper cleanup
+  private async _watchExpoUrlInBackground() {
+    if (!this.#expoUrlReader || !this.#expoWatcherAbortController) {
+      return;
+    }
+
+    const reader = this.#expoUrlReader;
+    const abortController = this.#expoWatcherAbortController;
     let buffer = '';
     const expoUrlRegex = /(exp:\/\/[^\s]+)/;
 
-    while (true) {
-      const { value, done } = await reader.read();
+    try {
+      while (!abortController.signal.aborted && !this.#disposed) {
+        const { value, done } = await reader.read();
 
-      if (done) {
-        break;
+        if (done || abortController.signal.aborted) {
+          break;
+        }
+
+        buffer += value || '';
+
+        const expoUrlMatch = buffer.match(expoUrlRegex);
+
+        if (expoUrlMatch) {
+          const cleanUrl = expoUrlMatch[1]
+            .replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '')
+            .replace(/[^\x20-\x7E]+$/g, '');
+          expoUrlAtom.set(cleanUrl);
+          buffer = buffer.slice(buffer.indexOf(expoUrlMatch[1]) + expoUrlMatch[1].length);
+        }
+
+        if (buffer.length > 2048) {
+          buffer = buffer.slice(-2048);
+        }
       }
-
-      buffer += value || '';
-
-      const expoUrlMatch = buffer.match(expoUrlRegex);
-
-      if (expoUrlMatch) {
-        const cleanUrl = expoUrlMatch[1]
-          .replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '')
-          .replace(/[^\x20-\x7E]+$/g, '');
-        expoUrlAtom.set(cleanUrl);
-        buffer = buffer.slice(buffer.indexOf(expoUrlMatch[1]) + expoUrlMatch[1].length);
+    } catch (error) {
+      if (!abortController.signal.aborted && !this.#disposed) {
+        console.warn('Expo URL watcher error:', error);
       }
-
-      if (buffer.length > 2048) {
-        buffer = buffer.slice(-2048);
+    } finally {
+      // Clean up reader
+      try {
+        reader.releaseLock();
+      } catch (error) {
+        // Reader might already be released
       }
     }
   }
@@ -281,6 +308,60 @@ export class BoltShell {
     }
 
     return { output: fullOutput, exitCode };
+  }
+
+  async dispose() {
+    if (this.#disposed) return;
+    
+    this.#disposed = true;
+
+    // Stop Expo URL watcher
+    if (this.#expoWatcherAbortController) {
+      this.#expoWatcherAbortController.abort();
+    }
+
+    // Clean up readers
+    try {
+      if (this.#outputStream) {
+        this.#outputStream.releaseLock();
+        this.#outputStream = undefined;
+      }
+    } catch (error) {
+      // Reader might already be released
+    }
+
+    try {
+      if (this.#expoUrlReader) {
+        this.#expoUrlReader.releaseLock();
+        this.#expoUrlReader = undefined;
+      }
+    } catch (error) {
+      // Reader might already be released
+    }
+
+    // Clean up writers
+    try {
+      if (this.#shellInputStream) {
+        await this.#shellInputStream.close();
+        this.#shellInputStream = undefined;
+      }
+    } catch (error) {
+      // Writer might already be closed
+    }
+
+    // Kill the process
+    try {
+      if (this.#process && !this.#process.killed) {
+        await this.#process.kill();
+      }
+    } catch (error) {
+      console.warn('Error killing BoltShell process:', error);
+    }
+
+    // Clear references
+    this.#process = undefined;
+    this.#terminal = undefined;
+    this.#webcontainer = undefined;
   }
 }
 

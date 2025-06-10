@@ -8,6 +8,7 @@ export class TerminalStore {
   #webcontainer: Promise<WebContainer>;
   #terminals: Array<{ terminal: ITerminal; process: WebContainerProcess }> = [];
   #boltTerminal = newBoltShellProcess();
+  #disposed = false;
 
   showTerminal: WritableAtom<boolean> = import.meta.hot?.data.showTerminal ?? atom(true);
 
@@ -16,6 +17,13 @@ export class TerminalStore {
 
     if (import.meta.hot) {
       import.meta.hot.data.showTerminal = this.showTerminal;
+    }
+
+    // Cleanup on page unload
+    if (typeof window !== 'undefined') {
+      const cleanup = () => this.dispose();
+      window.addEventListener('beforeunload', cleanup);
+      window.addEventListener('unload', cleanup);
     }
   }
   get boltTerminal() {
@@ -36,6 +44,11 @@ export class TerminalStore {
   }
 
   async attachTerminal(terminal: ITerminal) {
+    if (this.#disposed) {
+      console.warn('Cannot attach terminal to disposed TerminalStore');
+      return;
+    }
+
     try {
       const shellProcess = await newShellProcess(await this.#webcontainer, terminal);
       this.#terminals.push({ terminal, process: shellProcess });
@@ -45,9 +58,69 @@ export class TerminalStore {
     }
   }
 
+  async detachTerminal(terminal: ITerminal) {
+    const index = this.#terminals.findIndex(t => t.terminal === terminal);
+    if (index >= 0) {
+      const { process } = this.#terminals[index];
+      
+      try {
+        // Kill the process if it's still running
+        if (!process.killed) {
+          await process.kill();
+        }
+      } catch (error) {
+        console.warn('Error killing terminal process:', error);
+      }
+      
+      // Remove from the array
+      this.#terminals.splice(index, 1);
+    }
+  }
+
+  async detachAllTerminals() {
+    const terminalPromises = this.#terminals.map(async ({ process, terminal }) => {
+      try {
+        if (!process.killed) {
+          await process.kill();
+        }
+      } catch (error) {
+        console.warn('Error killing terminal process:', error);
+      }
+    });
+
+    await Promise.allSettled(terminalPromises);
+    this.#terminals = [];
+  }
+
   onTerminalResize(cols: number, rows: number) {
     for (const { process } of this.#terminals) {
-      process.resize({ cols, rows });
+      if (!process.killed) {
+        try {
+          process.resize({ cols, rows });
+        } catch (error) {
+          console.warn('Error resizing terminal:', error);
+        }
+      }
     }
+  }
+
+  async dispose() {
+    if (this.#disposed) return;
+    
+    this.#disposed = true;
+    
+    // Clean up all terminals
+    await this.detachAllTerminals();
+    
+    // Clean up bolt terminal
+    try {
+      await this.#boltTerminal.dispose?.();
+    } catch (error) {
+      console.warn('Error disposing bolt terminal:', error);
+    }
+  }
+
+  getActiveTerminalCount(): number {
+    return this.#terminals.filter(({ process }) => !process.killed).length;
   }
 }

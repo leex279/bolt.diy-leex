@@ -18,7 +18,7 @@ export const TerminalTabs = memo(() => {
   const showTerminal = useStore(workbenchStore.showTerminal);
   const theme = useStore(themeStore);
 
-  const terminalRefs = useRef<Array<TerminalRef | null>>([]);
+  const terminalRefs = useRef<Map<number, TerminalRef | null>>(new Map());
   const terminalPanelRef = useRef<ImperativePanelHandle>(null);
   const terminalToggledByShortcut = useRef(false);
 
@@ -56,7 +56,7 @@ export const TerminalTabs = memo(() => {
     });
 
     const unsubscribeFromThemeStore = themeStore.subscribe(() => {
-      for (const ref of Object.values(terminalRefs.current)) {
+      for (const ref of terminalRefs.current.values()) {
         ref?.reloadStyles();
       }
     });
@@ -64,6 +64,9 @@ export const TerminalTabs = memo(() => {
     return () => {
       unsubscribeFromEventEmitter();
       unsubscribeFromThemeStore();
+      
+      // Clean up terminal refs when component unmounts
+      terminalRefs.current.clear();
     };
   }, []);
 
@@ -154,7 +157,7 @@ export const TerminalTabs = memo(() => {
                     hidden: !isActive,
                   })}
                   ref={(ref) => {
-                    terminalRefs.current.push(ref);
+                    terminalRefs.current.set(index, ref);
                   }}
                   onTerminalReady={(terminal) => workbenchStore.attachBoltTerminal(terminal)}
                   onTerminalResize={(cols, rows) => workbenchStore.onTerminalResize(cols, rows)}
@@ -170,7 +173,7 @@ export const TerminalTabs = memo(() => {
                     hidden: !isActive,
                   })}
                   ref={(ref) => {
-                    terminalRefs.current.push(ref);
+                    terminalRefs.current.set(index, ref);
                   }}
                   onTerminalReady={(terminal) => workbenchStore.attachTerminal(terminal)}
                   onTerminalResize={(cols, rows) => workbenchStore.onTerminalResize(cols, rows)}

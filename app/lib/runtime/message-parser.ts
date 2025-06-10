@@ -72,13 +72,27 @@ function cleanEscapedTags(content: string) {
 }
 export class StreamingMessageParser {
   #messages = new Map<string, MessageState>();
+  #disposed = false;
+  #maxCacheSize = 100; // Limit cached messages to prevent unbounded growth
 
   constructor(private _options: StreamingMessageParserOptions = {}) {}
 
   parse(messageId: string, input: string) {
+    if (this.#disposed) {
+      throw new Error('Cannot parse with disposed StreamingMessageParser');
+    }
+
     let state = this.#messages.get(messageId);
 
     if (!state) {
+      // Implement LRU-like cache management to prevent unbounded growth
+      if (this.#messages.size >= this.#maxCacheSize) {
+        const oldestKey = this.#messages.keys().next().value;
+        if (oldestKey) {
+          this.#messages.delete(oldestKey);
+        }
+      }
+
       state = {
         position: 0,
         insideAction: false,
@@ -315,6 +329,44 @@ export class StreamingMessageParser {
   }
 
   reset() {
+    this.#messages.clear();
+  }
+
+  /**
+   * Remove a specific message from the cache
+   */
+  clearMessage(messageId: string) {
+    this.#messages.delete(messageId);
+  }
+
+  /**
+   * Get the current cache size for monitoring
+   */
+  getCacheSize() {
+    return this.#messages.size;
+  }
+
+  /**
+   * Clean up old messages beyond the cache limit
+   */
+  trimCache(maxSize: number = this.#maxCacheSize) {
+    while (this.#messages.size > maxSize) {
+      const oldestKey = this.#messages.keys().next().value;
+      if (oldestKey) {
+        this.#messages.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Dispose of the parser and clean up all resources
+   */
+  dispose() {
+    if (this.#disposed) return;
+    
+    this.#disposed = true;
     this.#messages.clear();
   }
 

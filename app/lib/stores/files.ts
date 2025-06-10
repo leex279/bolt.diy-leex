@@ -69,6 +69,14 @@ export class FilesStore {
    */
   files: MapStore<FileMap> = import.meta.hot?.data.files ?? map({});
 
+  /**
+   * Cleanup tracking
+   */
+  #disposed = false;
+  #watcherCleanup?: () => void;
+  #intervalId?: NodeJS.Timeout;
+  #mutationObserver?: MutationObserver;
+
   get filesCount() {
     return this.#size;
   }
@@ -108,7 +116,7 @@ export class FilesStore {
       let lastChatId = getCurrentChatId();
 
       // Use MutationObserver to detect URL changes (for SPA navigation)
-      const observer = new MutationObserver(() => {
+      this.#mutationObserver = new MutationObserver(() => {
         const currentChatId = getCurrentChatId();
 
         if (currentChatId !== lastChatId) {
@@ -118,7 +126,12 @@ export class FilesStore {
         }
       });
 
-      observer.observe(document, { subtree: true, childList: true });
+      this.#mutationObserver.observe(document, { subtree: true, childList: true });
+
+      // Set up cleanup on page unload
+      const cleanup = () => this.dispose();
+      window.addEventListener('beforeunload', cleanup);
+      window.addEventListener('unload', cleanup);
     }
 
     this.#init();
@@ -590,16 +603,31 @@ export class FilesStore {
   }
 
   async #init() {
+    if (this.#disposed) {
+      return;
+    }
+
     const webcontainer = await this.#webcontainer;
 
     // Clean up any files that were previously deleted
     this.#cleanupDeletedFiles();
 
-    // Set up file watcher
-    webcontainer.internal.watchPaths(
+    // Set up file watcher with cleanup tracking
+    const watcherUnsubscribe = webcontainer.internal.watchPaths(
       { include: [`${WORK_DIR}/**`], exclude: ['**/node_modules', '.git'], includeContent: true },
       bufferWatchEvents(100, this.#processEventBuffer.bind(this)),
     );
+    
+    // Store cleanup function
+    this.#watcherCleanup = () => {
+      try {
+        if (typeof watcherUnsubscribe === 'function') {
+          watcherUnsubscribe();
+        }
+      } catch (error) {
+        console.warn('Error cleaning up file watcher:', error);
+      }
+    };
 
     // Get the current chat ID
     const currentChatId = getCurrentChatId();
@@ -615,14 +643,20 @@ export class FilesStore {
      * This ensures that locks are applied even if files are loaded asynchronously.
      */
     setTimeout(() => {
-      this.#loadLockedFiles(currentChatId);
+      if (!this.#disposed) {
+        this.#loadLockedFiles(currentChatId);
+      }
     }, 2000);
 
     /**
      * Set up a less frequent periodic check to ensure locks remain applied.
      * This is now less critical since we have the storage event listener.
      */
-    setInterval(() => {
+    this.#intervalId = setInterval(() => {
+      if (this.#disposed) {
+        return;
+      }
+
       // Clear the cache to force a fresh read from localStorage
       clearCache();
 
@@ -925,6 +959,41 @@ export class FilesStore {
     } catch (error) {
       logger.error('Failed to persist deleted paths to localStorage', error);
     }
+  }
+
+  /**
+   * Clean up all resources to prevent memory leaks
+   */
+  dispose() {
+    if (this.#disposed) {
+      return;
+    }
+
+    this.#disposed = true;
+
+    // Clean up file watcher
+    try {
+      this.#watcherCleanup?.();
+    } catch (error) {
+      console.warn('Error during file watcher cleanup:', error);
+    }
+
+    // Clean up interval
+    if (this.#intervalId) {
+      clearInterval(this.#intervalId);
+      this.#intervalId = undefined;
+    }
+
+    // Clean up MutationObserver
+    try {
+      this.#mutationObserver?.disconnect();
+      this.#mutationObserver = undefined;
+    } catch (error) {
+      console.warn('Error cleaning up MutationObserver:', error);
+    }
+
+    // Clear references
+    this.#watcherCleanup = undefined;
   }
 }
 

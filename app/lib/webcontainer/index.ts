@@ -4,10 +4,13 @@ import { cleanStackTrace } from '~/utils/stacktrace';
 
 interface WebContainerContext {
   loaded: boolean;
+  eventListeners: Map<string, (message: any) => void>;
+  cleanup?: () => void;
 }
 
 export const webcontainerContext: WebContainerContext = import.meta.hot?.data.webcontainerContext ?? {
   loaded: false,
+  eventListeners: new Map(),
 };
 
 if (import.meta.hot) {
@@ -38,8 +41,8 @@ if (!import.meta.env.SSR) {
         const inspectorScript = await response.text();
         await webcontainer.setPreviewScript(inspectorScript);
 
-        // Listen for preview errors
-        webcontainer.on('preview-message', (message) => {
+        // Create a tracked preview message handler
+        const previewMessageHandler = (message: any) => {
           console.log('WebContainer preview message:', message);
 
           // Handle both uncaught exceptions and unhandled promise rejections
@@ -54,7 +57,40 @@ if (!import.meta.env.SSR) {
               source: 'preview',
             });
           }
-        });
+        };
+
+        // Track and listen for preview errors
+        webcontainerContext.eventListeners.set('preview-message', previewMessageHandler);
+        webcontainer.on('preview-message', previewMessageHandler);
+
+        // Set up cleanup function
+        webcontainerContext.cleanup = () => {
+          webcontainerContext.eventListeners.forEach((handler, eventName) => {
+            try {
+              webcontainer.off(eventName as any, handler);
+            } catch (error) {
+              console.warn(`Error removing WebContainer listener for ${eventName}:`, error);
+            }
+          });
+          webcontainerContext.eventListeners.clear();
+        };
+
+        // Clean up on page unload
+        if (typeof window !== 'undefined') {
+          const handleUnload = () => {
+            webcontainerContext.cleanup?.();
+          };
+          
+          window.addEventListener('beforeunload', handleUnload);
+          window.addEventListener('unload', handleUnload);
+          
+          // Also handle hot module replacement cleanup
+          if (import.meta.hot) {
+            import.meta.hot.dispose(() => {
+              webcontainerContext.cleanup?.();
+            });
+          }
+        }
 
         return webcontainer;
       });

@@ -7,6 +7,9 @@ const watcherState = {
   watchingPaths: new Set<string>(),
   callbacks: new Map<string, Set<() => void>>(),
   pollingInterval: null as NodeJS.Timeout | null,
+  disposed: false,
+  individualIntervals: new Set<NodeJS.Timeout>(),
+  cleanupListeners: new Set<() => void>(),
 };
 
 // Try to load the fallback state from localStorage
@@ -42,6 +45,10 @@ function saveFallbackState(state: boolean) {
  * @returns An object with a close method
  */
 export async function safeWatch(webcontainer: WebContainer, pattern: string = '**/*', callback: () => void) {
+  if (watcherState.disposed) {
+    throw new Error('Cannot watch files with disposed file watcher');
+  }
+
   // Register the callback
   if (!watcherState.callbacks.has(pattern)) {
     watcherState.callbacks.set(pattern, new Set());
@@ -131,9 +138,8 @@ export async function safeWatch(webcontainer: WebContainer, pattern: string = '*
         }
 
         // If no more callbacks, stop polling
-        if (watcherState.callbacks.size === 0 && watcherState.pollingInterval) {
-          clearInterval(watcherState.pollingInterval);
-          watcherState.pollingInterval = null;
+        if (watcherState.callbacks.size === 0) {
+          stopPolling();
         }
       },
     };
@@ -142,26 +148,46 @@ export async function safeWatch(webcontainer: WebContainer, pattern: string = '*
 
 // Ensure polling is active
 function ensurePollingActive() {
-  if (watcherState.pollingInterval) {
+  if (watcherState.pollingInterval || watcherState.disposed) {
     return;
   }
 
   // Set up a polling interval that calls all callbacks
   watcherState.pollingInterval = setInterval(() => {
+    if (watcherState.disposed) {
+      stopPolling();
+      return;
+    }
+    
     // Call all registered callbacks
     for (const [, callbacks] of watcherState.callbacks.entries()) {
-      callbacks.forEach((callback) => callback());
+      callbacks.forEach((callback) => {
+        try {
+          callback();
+        } catch (error) {
+          console.warn('[FileWatcher] Error in callback:', error);
+        }
+      });
     }
   }, 3000); // Poll every 3 seconds
 
-  // Clean up interval when window unloads
+  // Set up cleanup when window unloads
   if (typeof window !== 'undefined') {
-    window.addEventListener('beforeunload', () => {
-      if (watcherState.pollingInterval) {
-        clearInterval(watcherState.pollingInterval);
-        watcherState.pollingInterval = null;
-      }
-    });
+    const cleanup = () => {
+      disposeFileWatcher();
+    };
+    
+    watcherState.cleanupListeners.add(cleanup);
+    window.addEventListener('beforeunload', cleanup);
+    window.addEventListener('unload', cleanup);
+  }
+}
+
+// Stop polling
+function stopPolling() {
+  if (watcherState.pollingInterval) {
+    clearInterval(watcherState.pollingInterval);
+    watcherState.pollingInterval = null;
   }
 }
 
@@ -184,16 +210,29 @@ export function safeWatchPaths(
     ensurePollingActive();
 
     const interval = setInterval(() => {
+      if (watcherState.disposed) {
+        clearInterval(interval);
+        return;
+      }
+      
       // Use our helper to create a valid event
       const mockEvent = createMockEvent();
 
       // Wrap in the expected structure of nested arrays
-      callback([[mockEvent]]);
+      try {
+        callback([[mockEvent]]);
+      } catch (error) {
+        console.warn('[FileWatcher] Error in watchPaths callback:', error);
+      }
     }, 3000);
+
+    // Track this interval for cleanup
+    watcherState.individualIntervals.add(interval);
 
     return {
       close: () => {
         clearInterval(interval);
+        watcherState.individualIntervals.delete(interval);
       },
     };
   }
@@ -213,17 +252,79 @@ export function safeWatchPaths(
     ensurePollingActive();
 
     const interval = setInterval(() => {
+      if (watcherState.disposed) {
+        clearInterval(interval);
+        return;
+      }
+      
       // Use our helper to create a valid event
       const mockEvent = createMockEvent();
 
       // Wrap in the expected structure of nested arrays
-      callback([[mockEvent]]);
+      try {
+        callback([[mockEvent]]);
+      } catch (error) {
+        console.warn('[FileWatcher] Error in watchPaths callback:', error);
+      }
     }, 3000);
+
+    // Track this interval for cleanup
+    watcherState.individualIntervals.add(interval);
 
     return {
       close: () => {
         clearInterval(interval);
+        watcherState.individualIntervals.delete(interval);
       },
     };
   }
+}
+
+/**
+ * Dispose of the file watcher and clean up all resources
+ */
+export function disposeFileWatcher() {
+  if (watcherState.disposed) return;
+  
+  watcherState.disposed = true;
+  
+  // Clear main polling interval
+  stopPolling();
+  
+  // Clear all individual intervals
+  watcherState.individualIntervals.forEach(interval => {
+    clearInterval(interval);
+  });
+  watcherState.individualIntervals.clear();
+  
+  // Clear all callbacks and watchers
+  watcherState.callbacks.clear();
+  watcherState.watchingPaths.clear();
+  
+  // Remove event listeners
+  if (typeof window !== 'undefined') {
+    watcherState.cleanupListeners.forEach(cleanup => {
+      try {
+        window.removeEventListener('beforeunload', cleanup);
+        window.removeEventListener('unload', cleanup);
+      } catch (error) {
+        // Ignore errors removing listeners
+      }
+    });
+  }
+  watcherState.cleanupListeners.clear();
+}
+
+/**
+ * Get file watcher status for monitoring
+ */
+export function getFileWatcherStatus() {
+  return {
+    disposed: watcherState.disposed,
+    fallbackEnabled: watcherState.fallbackEnabled,
+    activeCallbacks: watcherState.callbacks.size,
+    watchingPaths: watcherState.watchingPaths.size,
+    pollingActive: !!watcherState.pollingInterval,
+    individualIntervals: watcherState.individualIntervals.size,
+  };
 }

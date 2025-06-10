@@ -26,6 +26,10 @@ export class PreviewsStore {
   #refreshTimeouts = new Map<string, NodeJS.Timeout>();
   #REFRESH_DELAY = 300;
   #storageChannel: BroadcastChannel;
+  #disposed = false;
+  #mutationObserver?: MutationObserver;
+  #watcherCleanup?: () => void;
+  #originalSetItem?: typeof localStorage.setItem;
 
   previews = atom<PreviewInfo[]>([]);
 
@@ -33,6 +37,13 @@ export class PreviewsStore {
     this.#webcontainer = webcontainerPromise;
     this.#broadcastChannel = new BroadcastChannel(PREVIEW_CHANNEL);
     this.#storageChannel = new BroadcastChannel('storage-sync-channel');
+
+    // Set up cleanup on page unload
+    if (typeof window !== 'undefined') {
+      const cleanup = () => this.dispose();
+      window.addEventListener('beforeunload', cleanup);
+      window.addEventListener('unload', cleanup);
+    }
 
     // Listen for preview updates from other tabs
     this.#broadcastChannel.onmessage = (event) => {
@@ -60,11 +71,13 @@ export class PreviewsStore {
 
     // Override localStorage setItem to catch all changes
     if (typeof window !== 'undefined') {
-      const originalSetItem = localStorage.setItem;
+      this.#originalSetItem = localStorage.setItem;
 
       localStorage.setItem = (...args) => {
-        originalSetItem.apply(localStorage, args);
-        this._broadcastStorageSync();
+        this.#originalSetItem!.apply(localStorage, args);
+        if (!this.#disposed) {
+          this._broadcastStorageSync();
+        }
       };
     }
 
@@ -153,13 +166,15 @@ export class PreviewsStore {
 
     try {
       // Watch for file changes
-      webcontainer.internal.watchPaths(
+      this.#watcherCleanup = webcontainer.internal.watchPaths(
         {
           // Only watch specific file types that affect the preview
           include: ['**/*.html', '**/*.css', '**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '**/*.json'],
           exclude: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/coverage/**'],
         },
         async (_events) => {
+          if (this.#disposed) return;
+          
           const previews = this.previews.get();
 
           for (const preview of previews) {
@@ -174,12 +189,14 @@ export class PreviewsStore {
 
       // Watch for DOM changes that might affect storage
       if (typeof window !== 'undefined') {
-        const observer = new MutationObserver((_mutations) => {
-          // Broadcast storage changes when DOM changes
-          this._broadcastStorageSync();
+        this.#mutationObserver = new MutationObserver((_mutations) => {
+          if (!this.#disposed) {
+            // Broadcast storage changes when DOM changes
+            this._broadcastStorageSync();
+          }
         });
 
-        observer.observe(document.body, {
+        this.#mutationObserver.observe(document.body, {
           childList: true,
           subtree: true,
           characterData: true,
@@ -228,41 +245,59 @@ export class PreviewsStore {
 
   // Broadcast state change to all tabs
   broadcastStateChange(previewId: string) {
+    if (this.#disposed) return;
+    
     const timestamp = Date.now();
     this.#lastUpdate.set(previewId, timestamp);
 
-    this.#broadcastChannel.postMessage({
-      type: 'state-change',
-      previewId,
-      timestamp,
-    });
+    try {
+      this.#broadcastChannel.postMessage({
+        type: 'state-change',
+        previewId,
+        timestamp,
+      });
+    } catch (error) {
+      console.warn('[Preview] Error broadcasting state change:', error);
+    }
   }
 
   // Broadcast file change to all tabs
   broadcastFileChange(previewId: string) {
+    if (this.#disposed) return;
+    
     const timestamp = Date.now();
     this.#lastUpdate.set(previewId, timestamp);
 
-    this.#broadcastChannel.postMessage({
-      type: 'file-change',
-      previewId,
-      timestamp,
-    });
+    try {
+      this.#broadcastChannel.postMessage({
+        type: 'file-change',
+        previewId,
+        timestamp,
+      });
+    } catch (error) {
+      console.warn('[Preview] Error broadcasting file change:', error);
+    }
   }
 
   // Broadcast update to all tabs
   broadcastUpdate(url: string) {
+    if (this.#disposed) return;
+    
     const previewId = this.getPreviewId(url);
 
     if (previewId) {
       const timestamp = Date.now();
       this.#lastUpdate.set(previewId, timestamp);
 
-      this.#broadcastChannel.postMessage({
-        type: 'file-change',
-        previewId,
-        timestamp,
-      });
+      try {
+        this.#broadcastChannel.postMessage({
+          type: 'file-change',
+          previewId,
+          timestamp,
+        });
+      } catch (error) {
+        console.warn('[Preview] Error broadcasting update:', error);
+      }
     }
   }
 
@@ -306,6 +341,65 @@ export class PreviewsStore {
         this.broadcastFileChange(previewId);
       }
     }
+  }
+
+  /**
+   * Dispose of the previews store and clean up all resources
+   */
+  dispose() {
+    if (this.#disposed) return;
+    
+    this.#disposed = true;
+
+    // Clear all timeouts
+    this.#refreshTimeouts.forEach(timeout => {
+      clearTimeout(timeout);
+    });
+    this.#refreshTimeouts.clear();
+
+    // Clean up file watcher
+    try {
+      if (this.#watcherCleanup) {
+        this.#watcherCleanup();
+        this.#watcherCleanup = undefined;
+      }
+    } catch (error) {
+      console.warn('[Preview] Error cleaning up file watcher:', error);
+    }
+
+    // Clean up MutationObserver
+    try {
+      if (this.#mutationObserver) {
+        this.#mutationObserver.disconnect();
+        this.#mutationObserver = undefined;
+      }
+    } catch (error) {
+      console.warn('[Preview] Error cleaning up MutationObserver:', error);
+    }
+
+    // Close broadcast channels
+    try {
+      this.#broadcastChannel.close();
+    } catch (error) {
+      console.warn('[Preview] Error closing broadcast channel:', error);
+    }
+
+    try {
+      this.#storageChannel.close();
+    } catch (error) {
+      console.warn('[Preview] Error closing storage channel:', error);
+    }
+
+    // Restore original localStorage.setItem
+    if (typeof window !== 'undefined' && this.#originalSetItem) {
+      localStorage.setItem = this.#originalSetItem;
+      this.#originalSetItem = undefined;
+    }
+
+    // Clear all data
+    this.#availablePreviews.clear();
+    this.#lastUpdate.clear();
+    this.#watchedFiles.clear();
   }
 }
 

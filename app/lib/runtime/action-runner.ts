@@ -67,6 +67,8 @@ export class ActionRunner {
   #webcontainer: Promise<WebContainer>;
   #currentExecutionPromise: Promise<void> = Promise.resolve();
   #shellTerminal: () => BoltShell;
+  #disposed = false;
+  #runningProcesses = new Set<any>();
   runnerId = atom<string>(`${Date.now()}`);
   actions: ActionsMap = map({});
   onAlert?: (alert: ActionAlert) => void;
@@ -86,9 +88,21 @@ export class ActionRunner {
     this.onAlert = onAlert;
     this.onSupabaseAlert = onSupabaseAlert;
     this.onDeployAlert = onDeployAlert;
+
+    // Set up cleanup on page unload
+    if (typeof window !== 'undefined') {
+      const cleanup = () => this.dispose();
+      window.addEventListener('beforeunload', cleanup);
+      window.addEventListener('unload', cleanup);
+    }
   }
 
   addAction(data: ActionCallbackData) {
+    if (this.#disposed) {
+      console.warn('Cannot add action to disposed ActionRunner');
+      return;
+    }
+
     const { actionId } = data;
 
     const actions = this.actions.get();
@@ -118,6 +132,11 @@ export class ActionRunner {
   }
 
   async runAction(data: ActionCallbackData, isStreaming: boolean = false) {
+    if (this.#disposed) {
+      console.warn('Cannot run action on disposed ActionRunner');
+      return;
+    }
+
     const { actionId } = data;
     const action = this.actions.get()[actionId];
 
@@ -384,6 +403,9 @@ export class ActionRunner {
 
     // Create a new terminal specifically for the build
     const buildProcess = await webcontainer.spawn('npm', ['run', 'build']);
+    
+    // Track this process for cleanup
+    this.#runningProcesses.add(buildProcess);
 
     let output = '';
     buildProcess.output.pipeTo(
@@ -395,6 +417,9 @@ export class ActionRunner {
     );
 
     const exitCode = await buildProcess.exit;
+    
+    // Remove from tracking when process completes
+    this.#runningProcesses.delete(buildProcess);
 
     if (exitCode !== 0) {
       // Trigger build failed alert
@@ -551,5 +576,53 @@ export class ActionRunner {
       deployStatus: deployStatus as any,
       source: details?.source || 'netlify',
     });
+  }
+
+  /**
+   * Dispose of the action runner and clean up all resources
+   */
+  dispose() {
+    if (this.#disposed) return;
+    
+    this.#disposed = true;
+
+    // Abort all running actions
+    const actions = this.actions.get();
+    Object.values(actions).forEach(action => {
+      if (action.status === 'running' || action.status === 'pending') {
+        try {
+          action.abort();
+        } catch (error) {
+          console.warn('Error aborting action:', error);
+        }
+      }
+    });
+
+    // Kill all running processes
+    this.#runningProcesses.forEach(process => {
+      try {
+        if (!process.killed) {
+          process.kill();
+        }
+      } catch (error) {
+        console.warn('Error killing process:', error);
+      }
+    });
+    this.#runningProcesses.clear();
+
+    // Clear actions
+    this.actions.set({});
+  }
+
+  /**
+   * Get action runner status for monitoring
+   */
+  getStatus() {
+    return {
+      disposed: this.#disposed,
+      runningProcesses: this.#runningProcesses.size,
+      activeActions: Object.keys(this.actions.get()).length,
+      runnerId: this.runnerId.get(),
+    };
   }
 }

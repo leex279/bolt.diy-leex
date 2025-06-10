@@ -10,6 +10,7 @@ import {
   type MutableRefObject,
   type RefCallback,
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -128,19 +129,52 @@ const STICK_TO_BOTTOM_OFFSET_PX = 70;
 const SIXTY_FPS_INTERVAL_MS = 1000 / 60;
 const RETAIN_ANIMATION_DURATION_MS = 350;
 
-let mouseDown = false;
+// Global mouse state with proper cleanup
+class MouseStateManager {
+  private static instance: MouseStateManager | null = null;
+  private mouseDown = false;
+  private listenerCount = 0;
+  private handlers = {
+    mousedown: () => { this.mouseDown = true; },
+    mouseup: () => { this.mouseDown = false; },
+    click: () => { this.mouseDown = false; },
+  };
 
-globalThis.document?.addEventListener('mousedown', () => {
-  mouseDown = true;
-});
+  static getInstance(): MouseStateManager {
+    if (!MouseStateManager.instance) {
+      MouseStateManager.instance = new MouseStateManager();
+    }
+    return MouseStateManager.instance;
+  }
 
-globalThis.document?.addEventListener('mouseup', () => {
-  mouseDown = false;
-});
+  addListener(): () => void {
+    if (this.listenerCount === 0 && typeof document !== 'undefined') {
+      // Add listeners only when first component mounts
+      document.addEventListener('mousedown', this.handlers.mousedown);
+      document.addEventListener('mouseup', this.handlers.mouseup);
+      document.addEventListener('click', this.handlers.click);
+    }
+    
+    this.listenerCount++;
+    
+    // Return cleanup function
+    return () => {
+      this.listenerCount--;
+      if (this.listenerCount === 0 && typeof document !== 'undefined') {
+        // Remove listeners when last component unmounts
+        document.removeEventListener('mousedown', this.handlers.mousedown);
+        document.removeEventListener('mouseup', this.handlers.mouseup);
+        document.removeEventListener('click', this.handlers.click);
+      }
+    };
+  }
 
-globalThis.document?.addEventListener('click', () => {
-  mouseDown = false;
-});
+  isMouseDown(): boolean {
+    return this.mouseDown;
+  }
+}
+
+const mouseStateManager = MouseStateManager.getInstance();
 
 export const useStickToBottom = (options: StickToBottomOptions = {}) => {
   const [escapedFromLock, updateEscapedFromLock] = useState(false);
@@ -150,8 +184,14 @@ export const useStickToBottom = (options: StickToBottomOptions = {}) => {
   const optionsRef = useRef<StickToBottomOptions>(null!);
   optionsRef.current = options;
 
+  // Add mouse state cleanup on mount/unmount
+  useEffect(() => {
+    const cleanup = mouseStateManager.addListener();
+    return cleanup;
+  }, []);
+
   const isSelecting = useCallback(() => {
-    if (!mouseDown) {
+    if (!mouseStateManager.isMouseDown()) {
       return false;
     }
 
